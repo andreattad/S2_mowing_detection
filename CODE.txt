@@ -1,0 +1,222 @@
+//-----------------------------------------CHOOSE THE REFERENCE DATASET
+//Choose Site (a=Lusia, b=Predazzo, c=Vigolana, d=Viote)
+var site='b' 
+//Choose Training (T) or Validation (V) Dataset 
+var trainvali='V'
+
+var meadows = ee.FeatureCollection("users/davideandreatta/ntagli/ref_data")
+        .filter(ee.Filter.eq('Train_Vali', trainvali))
+        .filter(ee.Filter.eq('sitecod', site));
+print(meadows,'meadows')
+        
+var Ref_dat = ee.Image("users/davideandreatta/ntagli/"+site).clipToCollection(meadows).int8();
+
+//-----------------------------------------CALIBRATED PARAMETERS 
+var NDW = 9 
+var RI = 12
+var RIback=ee.Number(RI).multiply(-2)
+var DROP= 0.15
+var startDate = ee.Algorithms.If(site===('a'),'2020-05-15',
+                ee.Algorithms.If(site===('d'),'2020-05-15','2020-04-15')); 
+var endDate = ee.Algorithms.If(site===('a'),'2020-10-15',
+                ee.Algorithms.If(site===('d'),'2020-10-15','2020-11-15')); 
+
+//-----------------------------------------IMAGE COLLECTION MASKING AND VI COMPUTATION
+// Cloud masking
+function maskCloudAndShadows(image) {
+  var cloudProb = image.select('MSK_CLDPRB');
+  var snowProb = image.select('MSK_SNWPRB');
+  var cloud = cloudProb.lt(5);
+  var snow = snowProb.lt(5);
+  var scl = image.select('SCL'); 
+  var shadow = scl.eq(3); // 3 = cloud shadow
+  var cirrus = scl.eq(10); // 10 = cirrus
+  // Cloud probability less than 5% or cloud shadow classification
+  var mask = (cloud.and(snow)).and(cirrus.neq(1)).and(shadow.neq(1));
+  return image.updateMask(mask)
+  .copyProperties(image, ['system:time_start']);
+}
+
+
+var s2collection = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate(startDate,endDate)
+    .map(maskCloudAndShadows)
+    .filter(ee.Filter.bounds(meadows))
+  print(s2collection,'s2collection')
+
+//add ndii band
+var addndii = function(image) {
+  var ndii = image.normalizedDifference(['B8', 'B11']).rename('ndii') ;
+  return image.addBands(ndii);
+};
+var withndii = s2collection.map(addndii).select('ndii');
+
+
+//-------------------------------------------SMOOTHING
+// settings for the days to filter on
+var unit = 'day';
+//list acquisition dates
+var AcquisDates = ee.List(withndii.aggregate_array("system:time_start"))
+    .map(function(d) { return ee.Date(d)});
+//compute STS 
+var STS =  ee.ImageCollection.fromImages(AcquisDates.map(function(date){
+  return withndii.filterDate(ee.Date(date).advance(ee.Number(NDW).multiply(-1), unit), 
+                            ee.Date(date).advance(NDW, unit).advance(1,unit))
+           .median()
+           .rename('median')
+           .set('system:time_start',ee.Date(date).millis());
+}));
+
+//----------------------------------------------------RESAMPLING
+// make a list of dates in which you want your mean
+var StartDate = ee.Date(startDate);
+var secondDate = StartDate.advance(RI, unit).millis();
+var increase = secondDate.subtract(StartDate.millis());
+var RTSDates = ee.List.sequence(StartDate.advance(
+                  ee.Number(RI).multiply(0.5),unit).millis(),
+                  ee.Date(endDate).millis(), increase);
+
+//map to the collection
+var RTS =  ee.ImageCollection.fromImages(RTSDates.map(function(date){
+            return STS.filterDate(ee.Date(date).advance(ee.Number(NDW).multiply(-1), unit), 
+                   ee.Date(date).advance(NDW, unit).advance(1,unit))
+                   .mean()
+                   .set('system:time_start',ee.Date(date).millis());
+                   }));
+
+var MTS =  ee.ImageCollection.fromImages(RTSDates.map(function(date){
+           return RTS.filterDate(ee.Date(date).advance(RIback, unit), ee.Date(date).advance(1, unit))
+                  .max()
+                  .rename('MTSbackwards')
+                  .set('system:time_start',ee.Date(date).millis());
+                  }));
+
+//---------------------------------------MOWING EVENT COUNT
+
+//Unmask and transform image collections into arrays 
+ var ar_MTS =MTS.map(function(img) { return img.unmask(-1.0); })
+                .toArrayPerBand(0);
+ var ar_RTS =RTS.map(function(img) { return img.unmask(-1.0); })
+                .toArrayPerBand(0);
+                
+//----------Prepare the count mowings function
+var countmowings = function(image) {
+  //is the value of RTS in time t lower than MTS in time t?
+   var infMTSYN = image.lt((ar_MTS.multiply(ee.Number(DROP).multiply(-1).add(1))));
+  //is the value of RTS in time t lower than RTS in time t+1 and t-1?
+  var ar_norm=image.arraySlice({axis: 0, start: 0});
+  var ar_1toright=image.arraySlice({axis: 0, start: 0, end: -1});
+  var arpos0= image.arraySlice({axis: 0, start: 0, end: 1});
+  var ar_1torightfilled=arpos0.arrayCat(ar_1toright,0);
+  var ar_1toleft=image.arraySlice({axis: 0, start: 1});
+  var ar_last=image.arraySlice({axis: 0, start: -1});
+  var ar_1toleftfilled=ar_1toleft.arrayCat(ar_last,0);
+  
+  var backwardslt0YN = ar_norm.subtract(ar_1torightfilled).lt(0);
+  var onwardsgt0YN = ar_norm.subtract(ar_1toleftfilled).lt(0);
+  
+  //------------------------------------------Count mowings events
+  var mowings = infMTSYN.and(backwardslt0YN).and(onwardsgt0YN)
+                    .arrayReduce(ee.Reducer.sum(), [0])
+                    .arrayGet([0]);
+  return mowings
+};
+
+var predictedPIXEL=(countmowings(ar_RTS)).rename('MF');
+
+
+//--------------------------------------------MAJORITY ANALYSIS
+var predictedPIXEL = predictedPIXEL.clipToCollection(meadows).int8()
+.reduceNeighborhood({
+  reducer: ee.Reducer.mode(),
+  kernel: ee.Kernel.square(3)
+})
+print(predictedPIXEL)
+//--------------------------------------------MANAGEMENT PARCEL ACCURACY
+var predictedPARCEL = predictedPIXEL.reduceRegions({
+                    collection: meadows,
+                    reducer: ee.Reducer.mode(),
+                    scale:10
+                    })
+ print(predictedPARCEL)                   
+var ErMaPARCEL = predictedPARCEL.errorMatrix('MF','mode');
+print(ErMaPARCEL)
+
+var export_PARCEL_accuracy= ee.Feature(null).set({
+                               Oaccuracy:ErMaPARCEL.accuracy(),
+                               Kaccuracy:ErMaPARCEL.kappa(),
+                               matrix:ErMaPARCEL.array()
+                                  })
+print(export_PARCEL_accuracy,'export_PARCEL_accuracy')
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection(export_PARCEL_accuracy),
+  description: 'export_PARCEL_accuracy'+'site'+site+'train_vali'+trainvali,
+  fileFormat: 'CSV'
+})
+//---------------------------------------------------PIXEL ACCURACY
+
+var stacked = Ref_dat.addBands(predictedPIXEL);
+print(stacked)
+
+var vectors = stacked.sample({region: meadows,
+                              dropNulls:false,
+                              geometries:true,
+                              scale:10
+                            });
+var ErMaPIXEL= vectors.errorMatrix('b1','MF_mode');
+var export_PIXEL_accuracy= ee.Feature(null).set({
+                               Oaccuracy:ErMaPIXEL.accuracy(),
+                               Kaccuracy:ErMaPIXEL.kappa(),
+                               matrix:ErMaPIXEL.array()
+                                  })
+print(export_PIXEL_accuracy)
+                               
+// Export the FeatureCollection.
+Export.table.toDrive({
+  collection: ee.FeatureCollection(export_PIXEL_accuracy),
+  description: 'export_PIXEL_accuracy'+'site'+site+'train_vali'+trainvali,
+  fileFormat: 'CSV'
+});
+
+//------------------------------------------------------EXPORT IMAGES
+var PIXEL_export=predictedPIXEL.unmask(-9999).clipToCollection(meadows)
+          Export.image.toDrive({
+            image: PIXEL_export,
+            description: 'export_PIXEL_image'+'site'+site+'train_vali'+trainvali,
+            scale: 10,
+            region: meadows.geometry().getInfo(),
+            });
+            
+Export.table.toDrive({fileFormat:'SHP',
+            collection: predictedPARCEL,
+            description: 'export_PARCEL_SHP'+'site'+site+'train_vali'+trainvali,
+            });
+
+//--------------------------------------------------------DISPLAY
+var empty = ee.Image().byte();
+var visparam={'min': 0,
+               'max': 5,
+               'palette': ['ADD8E6','FFFF00','FFA500','FF0000','EE82EE','000000']}
+Map.setOptions('SATELLITE');
+Map.centerObject(meadows)
+//display reference MF
+var Ref_dat_DISPLAY = empty.paint({
+  featureCollection: meadows,
+  color: 'MF'
+});
+//display predicted MF at parcel resolution
+var PredictedPARCEL_DISPLAY = empty.paint({
+  featureCollection: predictedPARCEL,
+  color: 'mode'
+});
+Map.addLayer(Ref_dat_DISPLAY, visparam, 'Ref_dat');
+Map.addLayer(PredictedPARCEL_DISPLAY, visparam, 'PredictedPARCEL');
+//display predicted MF at pixel resolution
+
+
+var visParams2 = {bands: ['MF_mode'],   
+      'min': 0,
+       'max': 5,
+       'palette': ['ADD8E6','FFFF00','FFA500','FF0000','EE82EE','000000']};
+Map.addLayer(predictedPIXEL.clipToCollection(meadows),visParams2,'predictedPIXEL');
