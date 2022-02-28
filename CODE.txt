@@ -1,19 +1,28 @@
+//------------------------------------------GENERAL INFORMATIONS
+//The following code is provided as a supplementary material of the article
+
+//Detection of grassland mowing frequency using time series of vegetation
+//indices from Sentinel-2 imagery. 
+
+//Davide Andreatta, Damiano Gianelle, Michele Scotton, Loris Vescovo and Michele Dalponte
+//doi:10.1080/15481603.2022.2036055
+//available at: https://doi.org/10.1080/15481603.2022.2036055
+
+
+
 //-----------------------------------------CHOOSE THE REFERENCE DATASET
 //Choose Site (a=Lusia, b=Predazzo, c=Vigolana, d=Viote)
 var site='b' 
-//Choose Training (T) or Validation (V) Dataset 
-var trainvali='V'
-
-var meadows = ee.FeatureCollection("users/davideandreatta/ntagli/ref_data")
-        .filter(ee.Filter.eq('Train_Vali', trainvali))
-        .filter(ee.Filter.eq('sitecod', site));
-print(meadows,'meadows')
+var meadows = ee.FeatureCollection("users/davideandreatta/forGITHUB/REFERENCE_GEE")
+              .filter(ee.Filter.eq('sitecod', site))
+          print(meadows,'meadows') 
         
-var Ref_dat = ee.Image("users/davideandreatta/ntagli/"+site).clipToCollection(meadows).int8();
+var Ref_dat = ee.Image("users/davideandreatta/forGITHUB/"+site)
+              .clipToCollection(meadows).int8();
 
 //-----------------------------------------CALIBRATED PARAMETERS 
 var NDW = 9 
-var RI = 12
+var RI = 11
 var RIback=ee.Number(RI).multiply(-2)
 var DROP= 0.15
 var startDate = ee.Algorithms.If(site===('a'),'2020-05-15',
@@ -42,33 +51,34 @@ var s2collection = ee.ImageCollection('COPERNICUS/S2_SR')
     .filterDate(startDate,endDate)
     .map(maskCloudAndShadows)
     .filter(ee.Filter.bounds(meadows))
+    .filterMetadata('MGRS_TILE', 'equals', '32TPS')
   print(s2collection,'s2collection')
 
-//add ndii band
-var addndii = function(image) {
-  var ndii = image.normalizedDifference(['B8', 'B11']).rename('ndii') ;
-  return image.addBands(ndii);
+//add VI band
+var addVI = function(image) {
+  var VI = image.normalizedDifference(['B8', 'B11']).rename('VI');
+  return image.addBands(VI);
 };
-var withndii = s2collection.map(addndii).select('ndii');
+var VITS = s2collection.map(addVI).select('VI');
 
 
 //-------------------------------------------SMOOTHING
 // settings for the days to filter on
 var unit = 'day';
 //list acquisition dates
-var AcquisDates = ee.List(withndii.aggregate_array("system:time_start"))
+var AcquisDates = ee.List(VITS.aggregate_array("system:time_start"))
     .map(function(d) { return ee.Date(d)});
 //compute STS 
 var STS =  ee.ImageCollection.fromImages(AcquisDates.map(function(date){
-  return withndii.filterDate(ee.Date(date).advance(ee.Number(NDW).multiply(-1), unit), 
+  return VITS.filterDate(ee.Date(date).advance(ee.Number(NDW).multiply(-1), unit), 
                             ee.Date(date).advance(NDW, unit).advance(1,unit))
-           .median()
-           .rename('median')
-           .set('system:time_start',ee.Date(date).millis());
+                           .median()
+                           .rename('median')
+                           .set('system:time_start',ee.Date(date).millis());
 }));
 
 //----------------------------------------------------RESAMPLING
-// make a list of dates in which you want your mean
+// make a list of Resampled dates
 var StartDate = ee.Date(startDate);
 var secondDate = StartDate.advance(RI, unit).millis();
 var increase = secondDate.subtract(StartDate.millis());
@@ -99,7 +109,7 @@ var MTS =  ee.ImageCollection.fromImages(RTSDates.map(function(date){
  var ar_RTS =RTS.map(function(img) { return img.unmask(-1.0); })
                 .toArrayPerBand(0);
                 
-//----------Prepare the count mowings function
+//----------Prepare the function to count mowing events
 var countmowings = function(image) {
   //is the value of RTS in time t lower than MTS in time t?
    var infMTSYN = image.lt((ar_MTS.multiply(ee.Number(DROP).multiply(-1).add(1))));
@@ -114,8 +124,7 @@ var countmowings = function(image) {
   
   var backwardslt0YN = ar_norm.subtract(ar_1torightfilled).lt(0);
   var onwardsgt0YN = ar_norm.subtract(ar_1toleftfilled).lt(0);
-  
-  //------------------------------------------Count mowings events
+   
   var mowings = infMTSYN.and(backwardslt0YN).and(onwardsgt0YN)
                     .arrayReduce(ee.Reducer.sum(), [0])
                     .arrayGet([0]);
@@ -127,70 +136,73 @@ var predictedPIXEL=(countmowings(ar_RTS)).rename('MF');
 
 //--------------------------------------------MAJORITY ANALYSIS
 var predictedPIXEL = predictedPIXEL.clipToCollection(meadows).int8()
-.reduceNeighborhood({
-  reducer: ee.Reducer.mode(),
-  kernel: ee.Kernel.square(3)
-})
-print(predictedPIXEL)
+                                    .reduceNeighborhood({
+                                                reducer: ee.Reducer.mode(),
+                                                kernel: ee.Kernel.square(3)
+                                                        })
 //--------------------------------------------MANAGEMENT PARCEL ACCURACY
 var predictedPARCEL = predictedPIXEL.reduceRegions({
                     collection: meadows,
                     reducer: ee.Reducer.mode(),
                     scale:10
                     })
- print(predictedPARCEL)                   
+               
 var ErMaPARCEL = predictedPARCEL.errorMatrix('MF','mode');
-print(ErMaPARCEL)
 
-var export_PARCEL_accuracy= ee.Feature(null).set({
-                               Oaccuracy:ErMaPARCEL.accuracy(),
-                               Kaccuracy:ErMaPARCEL.kappa(),
-                               matrix:ErMaPARCEL.array()
-                                  })
-print(export_PARCEL_accuracy,'export_PARCEL_accuracy')
+var pa_ref_arr=ee.Array(predictedPARCEL.aggregate_array('MF'))
+var pa_pred_arr=ee.Array(predictedPARCEL.aggregate_array('mode'))
+var MAEparcel=((pa_ref_arr.subtract(pa_pred_arr)).abs())
+              .reduce(ee.Reducer.mean(),[0])
 
-Export.table.toDrive({
-  collection: ee.FeatureCollection(export_PARCEL_accuracy),
-  description: 'export_PARCEL_accuracy'+'site'+site+'train_vali'+trainvali,
-  fileFormat: 'CSV'
-})
+print(MAEparcel,'MAEparcel')
+print(ErMaPARCEL,'ErMaparcel')
+
 //---------------------------------------------------PIXEL ACCURACY
 
-var stacked = Ref_dat.addBands(predictedPIXEL);
-print(stacked)
+var stacked = Ref_dat.addBands(predictedPIXEL).rename('reference','predicted')
+                      .clipToCollection(meadows);
+var forCF=stacked.sample({
+  region: meadows,
+  dropNulls:true,
+  geometries:true,
+  scale:10,
+  seed:1
+ })
+ .filterBounds(meadows)
+ 
+var ErMapixel=forCF.errorMatrix('reference','predicted')
+print(ErMapixel.accuracy(),'Overall accuracy pixel')
+ 
+var maeimage= ((stacked.select('predicted')).subtract((stacked.select('reference')))).abs()
+.rename('MAE');
 
-var vectors = stacked.sample({region: meadows,
-                              dropNulls:false,
-                              geometries:true,
-                              scale:10
-                            });
-var ErMaPIXEL= vectors.errorMatrix('b1','MF_mode');
-var export_PIXEL_accuracy= ee.Feature(null).set({
-                               Oaccuracy:ErMaPIXEL.accuracy(),
-                               Kaccuracy:ErMaPIXEL.kappa(),
-                               matrix:ErMaPIXEL.array()
-                                  })
-print(export_PIXEL_accuracy)
-                               
-// Export the FeatureCollection.
-Export.table.toDrive({
-  collection: ee.FeatureCollection(export_PIXEL_accuracy),
-  description: 'export_PIXEL_accuracy'+'site'+site+'train_vali'+trainvali,
-  fileFormat: 'CSV'
-});
+var vectors = maeimage.sample({
+  region: meadows,
+  dropNulls:true,
+  geometries:true,
+  scale:10,
+  seed:1
+ }).filterBounds(meadows)
+ 
+ 
+ var MAEpixel=vectors.aggregate_mean('MAE')
+print(MAEpixel,'MAEpixel')
+print(ErMapixel,'ErMapixel')
 
 //------------------------------------------------------EXPORT IMAGES
-var PIXEL_export=predictedPIXEL.unmask(-9999).clipToCollection(meadows)
+
+var PIXEL_export=predictedPIXEL
+         .clip(meadows).unmask(-9999)
           Export.image.toDrive({
             image: PIXEL_export,
-            description: 'export_PIXEL_image'+'site'+site+'train_vali'+trainvali,
+            description: 'export_PIXEL_image'+'site'+site,
             scale: 10,
             region: meadows.geometry().getInfo(),
             });
             
 Export.table.toDrive({fileFormat:'SHP',
             collection: predictedPARCEL,
-            description: 'export_PARCEL_SHP'+'site'+site+'train_vali'+trainvali,
+            description: 'export_PARCEL_SHP'+'site'+site,
             });
 
 //--------------------------------------------------------DISPLAY
